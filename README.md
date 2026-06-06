@@ -8,24 +8,22 @@ The app lives in `outputs/`.
 
 ## Quick Start
 
-Install Python 3.11, then run this in PowerShell:
+Open PowerShell and run:
 
 ```powershell
 cd outputs
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe jjs_piano_studio.py
+python -m pip install -r requirements.txt
+python jjs_piano_studio.py
 ```
 
 After setup, open the app anytime with:
 
 ```powershell
 cd outputs
-.\.venv\Scripts\python.exe jjs_piano_studio.py
+python jjs_piano_studio.py
 ```
 
-Use Python 3.11. Python 3.13 may fail with the audio-to-MIDI packages.
+Use Python 3.11 if the audio-to-MIDI packages fail on newer Python versions.
 
 ## Main Files
 

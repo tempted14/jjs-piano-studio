@@ -7,23 +7,21 @@ calibration tests, and a live preview keyboard.
 
 ## Install
 
-Use **Python 3.11**. Open PowerShell in this folder and run:
+Open PowerShell in this folder and run:
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Then start the app:
 
 ```powershell
-.\.venv\Scripts\python.exe jjs_piano_studio.py
+python jjs_piano_studio.py
 ```
 
 After setup, you only need the start command.
 
-Python 3.13 may fail with the audio-to-MIDI packages, so use Python 3.11.
+Use Python 3.11 if the audio-to-MIDI packages fail on newer Python versions.
 
 ## Quick Play
 
