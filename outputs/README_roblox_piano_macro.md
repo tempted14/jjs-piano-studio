@@ -7,17 +7,12 @@ calibration tests, and a live preview keyboard.
 
 ## Install
 
-Use **Python 3.11** for this project. Python 3.13 will fail while installing the
-audio-to-MIDI stack because older NumPy/Basic Pitch dependencies do not have
-compatible Python 3.13 wheels.
-
-Install Python 3.11 from python.org first. During setup, check `Add python.exe
-to PATH`.
-
-Then open PowerShell in this folder and run:
+Use **Python 3.11**. Open PowerShell in this folder and run:
 
 ```powershell
-.\setup_python311_venv.ps1
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 Then start the app:
@@ -26,13 +21,9 @@ Then start the app:
 .\.venv\Scripts\python.exe jjs_piano_studio.py
 ```
 
-If PowerShell blocks the setup script, run:
+After setup, you only need the start command.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Then run `.\setup_python311_venv.ps1` again.
+Python 3.13 may fail with the audio-to-MIDI packages, so use Python 3.11.
 
 ## Quick Play
 
