@@ -72,6 +72,14 @@ ONLINE_SEQUENCE_TICKS_PER_BEAT = 384
 ONLINE_SEQUENCE_TICKS_PER_UNIT = 96
 ONLINE_SEARCH_MAX_CANDIDATES = 72
 ONLINE_SEARCH_WORKERS = 6
+NOTE_ART_SCAN_SECONDS = 60.0
+NOTE_ART_BIN_SECONDS = 0.5
+NOTE_ART_INITIAL_WINDOW_SECONDS = 3.0
+NOTE_ART_MAX_SPAM_GAP_SECONDS = 3.0
+NOTE_ART_MIN_REMOVED_NOTES = 80
+NOTE_ART_STARTS_PER_SECOND = 55.0
+NOTE_ART_UNIQUE_PITCHES_PER_BIN = 30
+NOTE_ART_ACTIVE_NOTES = 28
 ONLINE_SEARCH_SORT_OPTIONS = (
     "Best playable",
     "Best match",
@@ -198,6 +206,8 @@ class PreparedOnlineMidi:
     bpm: float | None
     summary: str
     repaired: bool = False
+    trimmed_seconds: float = 0.0
+    trimmed_notes: int = 0
 
 
 @dataclass
@@ -1304,15 +1314,118 @@ def summarize_midi_actions_for_status(actions: list[ScheduledAction]) -> str:
     )
 
 
+def estimate_note_art_intro_seconds(notes: list[AudioMidiNote]) -> float:
+    if len(notes) < NOTE_ART_MIN_REMOVED_NOTES:
+        return 0.0
+    duration = max((note.end for note in notes), default=0.0)
+    if duration <= 0:
+        return 0.0
+    scan_end = min(NOTE_ART_SCAN_SECONDS, duration * 0.35, duration)
+    if scan_end < NOTE_ART_BIN_SECONDS:
+        return 0.0
+
+    bin_count = max(1, int(math.ceil(scan_end / NOTE_ART_BIN_SECONDS)))
+    starts_by_bin = [0] * bin_count
+    pitches_by_bin: list[set[int]] = [set() for _ in range(bin_count)]
+    events: list[tuple[float, int]] = []
+
+    for note in notes:
+        if note.start < scan_end:
+            index = min(bin_count - 1, max(0, int(note.start / NOTE_ART_BIN_SECONDS)))
+            starts_by_bin[index] += 1
+            pitches_by_bin[index].add(note.midi)
+        if note.start < scan_end and note.end > 0:
+            events.append((max(0.0, note.start), 1))
+            events.append((min(scan_end, note.end), -1))
+
+    active_by_bin = [0] * bin_count
+    events.sort(key=lambda item: (item[0], -item[1]))
+    event_index = 0
+    active = 0
+    for index in range(bin_count):
+        center = min(scan_end, index * NOTE_ART_BIN_SECONDS + NOTE_ART_BIN_SECONDS * 0.5)
+        while event_index < len(events) and events[event_index][0] <= center:
+            active += events[event_index][1]
+            event_index += 1
+        active_by_bin[index] = active
+
+    spam_bins: list[int] = []
+    for index in range(bin_count):
+        starts_per_second = starts_by_bin[index] / NOTE_ART_BIN_SECONDS
+        if (
+            starts_per_second >= NOTE_ART_STARTS_PER_SECOND
+            or len(pitches_by_bin[index]) >= NOTE_ART_UNIQUE_PITCHES_PER_BIN
+            or active_by_bin[index] >= NOTE_ART_ACTIVE_NOTES
+        ):
+            spam_bins.append(index)
+
+    if not spam_bins:
+        return 0.0
+    first_spam_start = spam_bins[0] * NOTE_ART_BIN_SECONDS
+    if first_spam_start > NOTE_ART_INITIAL_WINDOW_SECONDS:
+        return 0.0
+
+    last_spam = spam_bins[0]
+    for index in spam_bins[1:]:
+        gap_seconds = (index - last_spam - 1) * NOTE_ART_BIN_SECONDS
+        if gap_seconds > NOTE_ART_MAX_SPAM_GAP_SECONDS:
+            break
+        last_spam = index
+
+    trim_seconds = min(scan_end, (last_spam + 1) * NOTE_ART_BIN_SECONDS)
+    starts = sorted(note.start for note in notes if note.start >= trim_seconds)
+    if starts and starts[0] - trim_seconds <= 8.0:
+        trim_seconds = starts[0]
+
+    removed_notes = sum(1 for note in notes if note.start < trim_seconds)
+    if removed_notes < NOTE_ART_MIN_REMOVED_NOTES:
+        return 0.0
+    remaining_notes = len(notes) - removed_notes
+    if remaining_notes < 20:
+        return 0.0
+    return max(0.0, trim_seconds)
+
+
+def trim_note_art_intro_actions(actions: list[ScheduledAction]) -> tuple[list[ScheduledAction], float, int]:
+    notes = scheduled_actions_to_audio_notes(actions)
+    trim_seconds = estimate_note_art_intro_seconds(notes)
+    if trim_seconds <= 0:
+        return actions, 0.0, 0
+
+    kept: list[AudioMidiNote] = []
+    removed_notes = 0
+    for note in notes:
+        if note.start < trim_seconds:
+            removed_notes += 1
+            continue
+        kept.append(
+            AudioMidiNote(
+                start=max(0.0, note.start - trim_seconds),
+                end=max(0.001, note.end - trim_seconds),
+                midi=note.midi,
+                velocity=note.velocity,
+            )
+        )
+    if not kept:
+        return actions, 0.0, 0
+    return audio_notes_to_actions(kept), trim_seconds, removed_notes
+
+
 def prepare_online_midi_load(
     result: OnlineSequenceResult,
     run_timing_repair: bool,
     repair_settings: dict[str, float | bool],
+    trim_note_art_intro: bool = True,
 ) -> PreparedOnlineMidi:
     path = download_online_sequence_midi(result)
     actions = load_midi_actions(str(path))
     detected_bpm = read_midi_primary_bpm(path)
     repaired = False
+    trimmed_seconds = 0.0
+    trimmed_notes = 0
+
+    if trim_note_art_intro:
+        actions, trimmed_seconds, trimmed_notes = trim_note_art_intro_actions(actions)
 
     if run_timing_repair:
         notes = scheduled_actions_to_audio_notes(actions)
@@ -1337,6 +1450,8 @@ def prepare_online_midi_load(
             repaired = True
 
     summary = summarize_midi_actions_for_status(actions)
+    if trimmed_seconds > 0:
+        summary = f"{summary} | Skipped intro: {trimmed_seconds:.1f}s ({trimmed_notes} notes)"
     return PreparedOnlineMidi(
         path=path,
         result=result,
@@ -1344,6 +1459,8 @@ def prepare_online_midi_load(
         bpm=detected_bpm,
         summary=summary,
         repaired=repaired,
+        trimmed_seconds=trimmed_seconds,
+        trimmed_notes=trimmed_notes,
     )
 
 
@@ -5054,11 +5171,18 @@ class PianoMacroApp(tk.Tk):
             f"Downloaded from Online Sequencer #{prepared.result.sequence_id}: {prepared.result.url}",
             f"Generated MIDI: {prepared.path}",
         ]
+        if prepared.trimmed_seconds > 0:
+            notes.append(f"Skipped note-art intro: {prepared.trimmed_seconds:.1f}s, {prepared.trimmed_notes} notes removed.")
         if prepared.repaired:
             notes.append("Timing repair was applied during load.")
         self.song_notes.set("\n".join(notes))
         self.analysis_summary.set(prepared.summary)
-        suffix = " with timing repair" if prepared.repaired else ""
+        status_parts = []
+        if prepared.trimmed_seconds > 0:
+            status_parts.append("note-art trim")
+        if prepared.repaired:
+            status_parts.append("timing repair")
+        suffix = f" with {', '.join(status_parts)}" if status_parts else ""
         self.status.set(f"Loaded Online Sequencer MIDI{suffix}: {prepared.result.title}")
 
     def open_online_midi_search_tool(self) -> None:
@@ -5075,6 +5199,7 @@ class PianoMacroApp(tk.Tk):
         status_var = tk.StringVar(value="Search Online Sequencer by song name, artist, URL, or sequence ID.")
         detail_var = tk.StringVar(value="Select a result to see its page. MIDI files are generated locally from page data.")
         auto_repair_var = tk.BooleanVar(value=False)
+        auto_trim_art_var = tk.BooleanVar(value=True)
         results_by_iid: dict[str, OnlineSequenceResult] = {}
         current_results: dict[str, list[OnlineSequenceResult]] = {"items": []}
         result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -5172,6 +5297,9 @@ class PianoMacroApp(tk.Tk):
         options_row.columnconfigure(3, weight=1)
         ttk.Checkbutton(options_row, text="Run timing repair after load", variable=auto_repair_var).grid(
             row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        ttk.Checkbutton(options_row, text="Auto-skip note-art intro", variable=auto_trim_art_var).grid(
+            row=0, column=1, sticky="w", padx=(0, 12)
         )
 
         button_row = ttk.Frame(root)
@@ -5312,6 +5440,7 @@ class PianoMacroApp(tk.Tk):
             if result is None:
                 return
             auto_repair = bool(auto_repair_var.get())
+            auto_trim_art = bool(auto_trim_art_var.get())
             repair_settings = self._online_midi_repair_settings()
             if load_after:
                 set_busy(True, f"Downloading and preparing MIDI for: {result.title}")
@@ -5322,7 +5451,7 @@ class PianoMacroApp(tk.Tk):
             def worker() -> None:
                 try:
                     if load_after:
-                        prepared = prepare_online_midi_load(result, auto_repair, repair_settings)
+                        prepared = prepare_online_midi_load(result, auto_repair, repair_settings, auto_trim_art)
                         result_queue.put(("load_ok", prepared))
                     else:
                         path = download_online_sequence_midi(result)

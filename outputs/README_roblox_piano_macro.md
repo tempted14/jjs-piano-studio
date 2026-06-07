@@ -72,6 +72,9 @@ locally. Downloaded files are saved in `online_midis` beside the app.
 The importer matches Online Sequencer's timing grid, and `Download & Load`
 prepares the MIDI in the background so larger songs do not freeze the window
 while they are parsed.
+`Auto-skip note-art intro` is enabled by default. It detects extremely dense
+intro note art and starts playback after that section instead of smashing the
+Roblox piano with thousands of decorative notes.
 
 Recommended workflow:
 
