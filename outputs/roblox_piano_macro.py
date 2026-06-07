@@ -4256,6 +4256,28 @@ class PianoMacroApp(tk.Tk):
             font=("Segoe UI", 10),
         )
 
+    def _scroll_canvas_with_mousewheel(self, canvas: tk.Canvas, event: tk.Event) -> str:
+        event_num = getattr(event, "num", None)
+        if event_num == 4:
+            units = -3
+        elif event_num == 5:
+            units = 3
+        else:
+            delta = getattr(event, "delta", 0)
+            units = -int(delta / 120) if delta else 0
+            if units == 0 and delta:
+                units = -1 if delta > 0 else 1
+        if units:
+            canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _bind_mousewheel_to_canvas(self, widget: tk.Widget, canvas: tk.Canvas) -> None:
+        widget.bind("<MouseWheel>", lambda event: self._scroll_canvas_with_mousewheel(canvas, event))
+        widget.bind("<Button-4>", lambda event: self._scroll_canvas_with_mousewheel(canvas, event))
+        widget.bind("<Button-5>", lambda event: self._scroll_canvas_with_mousewheel(canvas, event))
+        for child in widget.winfo_children():
+            self._bind_mousewheel_to_canvas(child, canvas)
+
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=16)
         root.pack(fill=tk.BOTH, expand=True)
@@ -4360,9 +4382,20 @@ class PianoMacroApp(tk.Tk):
         self.keyboard_canvas.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         self.keyboard_canvas.bind("<Configure>", lambda _event: self.draw_keyboard_preview())
 
-        side = ttk.Frame(paned, padding=(14, 8, 0, 0))
+        side_container = ttk.Frame(paned, padding=(14, 8, 0, 0))
+        side_container.columnconfigure(0, weight=1)
+        side_container.rowconfigure(0, weight=1)
+        side_canvas = tk.Canvas(side_container, bg=UI_BG, highlightthickness=0, borderwidth=0)
+        side_scrollbar = ttk.Scrollbar(side_container, orient=tk.VERTICAL, command=side_canvas.yview)
+        side_canvas.configure(yscrollcommand=side_scrollbar.set)
+        side_canvas.grid(row=0, column=0, sticky="nsew")
+        side_scrollbar.grid(row=0, column=1, sticky="ns")
+        side = ttk.Frame(side_canvas, padding=(0, 0, 12, 0))
         side.columnconfigure(1, weight=1)
-        paned.add(side, weight=1)
+        side_window = side_canvas.create_window((0, 0), window=side, anchor="nw")
+        side.bind("<Configure>", lambda _event: side_canvas.configure(scrollregion=side_canvas.bbox("all")))
+        side_canvas.bind("<Configure>", lambda event: side_canvas.itemconfigure(side_window, width=event.width))
+        paned.add(side_container, weight=1)
 
         row = 0
         ttk.Label(side, text="Playback", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w")
@@ -4516,6 +4549,7 @@ class PianoMacroApp(tk.Tk):
         row += 1
 
         ttk.Progressbar(root, variable=self.progress, maximum=100).grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self._bind_mousewheel_to_canvas(side_container, side_canvas)
 
     def _build_library_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Song Library", style="Section.TLabel").grid(row=0, column=0, sticky="w")
