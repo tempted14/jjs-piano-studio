@@ -27,7 +27,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
 from tkinter import ttk
 from ctypes import wintypes
@@ -207,6 +207,8 @@ class PreparedOnlineMidi:
     repaired: bool = False
     trimmed_seconds: float = 0.0
     trimmed_notes: int = 0
+    cleaned_before_notes: int = 0
+    cleaned_after_notes: int = 0
 
 
 @dataclass
@@ -217,6 +219,8 @@ class PlaybackSettings:
     hold_percent: float
     gap_ms: float
     start_delay: float
+    start_offset_seconds: float
+    end_at_seconds: float
     transpose: int
     low_midi: int
     high_midi: int
@@ -1211,6 +1215,25 @@ def download_online_sequence_midi(
     return path
 
 
+def download_direct_midi_url(url: str, destination_dir: Path = ONLINE_MIDI_DIR) -> Path:
+    clean_url = url.strip()
+    if not clean_url.lower().startswith(("http://", "https://")):
+        raise ValueError("Enter a full http:// or https:// MIDI URL.")
+    data = http_get_bytes(clean_url, timeout=ONLINE_DOWNLOAD_TIMEOUT_SECONDS, max_bytes=ONLINE_DOWNLOAD_MAX_BYTES)
+    if not data.startswith(b"MThd"):
+        raise ValueError("That URL did not return a valid MIDI file.")
+    destination_dir.mkdir(exist_ok=True)
+    parsed = urlparse(clean_url)
+    filename = sanitize_filename(Path(parsed.path).name or "direct_midi.mid")
+    if not filename.lower().endswith((".mid", ".midi")):
+        filename += ".mid"
+    path = destination_dir / filename
+    if path.exists():
+        path = destination_dir / f"{Path(filename).stem}_{int(time.time())}{Path(filename).suffix}"
+    path.write_bytes(data)
+    return path
+
+
 def scheduled_actions_to_audio_notes(actions: list[ScheduledAction]) -> list[AudioMidiNote]:
     active: dict[int, list[float]] = {}
     notes: list[AudioMidiNote] = []
@@ -1410,11 +1433,133 @@ def trim_note_art_intro_actions(actions: list[ScheduledAction]) -> tuple[list[Sc
     return audio_notes_to_actions(kept), trim_seconds, removed_notes
 
 
+def window_scheduled_actions(
+    actions: list[ScheduledAction],
+    start_seconds: float = 0.0,
+    end_seconds: float = 0.0,
+) -> list[ScheduledAction]:
+    start_seconds = max(0.0, float(start_seconds))
+    end_seconds = max(0.0, float(end_seconds))
+    if end_seconds > 0 and end_seconds <= start_seconds:
+        end_seconds = 0.0
+    if start_seconds <= 0 and end_seconds <= 0:
+        return coalesce_scheduled_actions(actions)
+
+    has_raw_keys = any(playable.kind == "key" for action in actions for playable in action.notes)
+    if has_raw_keys:
+        filtered = [
+            ScheduledAction(
+                seconds=max(0.0, action.seconds - start_seconds),
+                action=action.action,
+                notes=action.notes,
+            )
+            for action in actions
+            if action.seconds >= start_seconds and (end_seconds <= 0 or action.seconds <= end_seconds)
+        ]
+        return coalesce_scheduled_actions(filtered)
+
+    notes = scheduled_actions_to_audio_notes(actions)
+    clipped: list[AudioMidiNote] = []
+    for note in notes:
+        if note.end <= start_seconds:
+            continue
+        if end_seconds > 0 and note.start >= end_seconds:
+            continue
+        start = max(note.start, start_seconds)
+        end = note.end if end_seconds <= 0 else min(note.end, end_seconds)
+        if end <= start:
+            continue
+        clipped.append(
+            AudioMidiNote(
+                start=max(0.0, start - start_seconds),
+                end=max(0.001, end - start_seconds),
+                midi=note.midi,
+                velocity=note.velocity,
+            )
+        )
+    return audio_notes_to_actions(clipped)
+
+
+def cleanup_midi_notes_for_playability(
+    notes: list[AudioMidiNote],
+    bpm: float,
+    low_midi: int,
+    high_midi: int,
+    max_polyphony: int = 4,
+) -> list[AudioMidiNote]:
+    if not notes:
+        return []
+    beat_seconds = 60.0 / max(1.0, bpm)
+    grid_seconds = max(0.035, beat_seconds * 0.125)
+    min_seconds = max(0.035, beat_seconds * 0.08)
+    max_seconds = max(min_seconds, beat_seconds * 8.0)
+    prepared: list[AudioMidiNote] = []
+    for note in notes:
+        if note.end <= note.start:
+            continue
+        midi_note = fit_midi_to_range(note.midi, low_midi, high_midi)
+        duration = max(min_seconds, min(max_seconds, note.end - note.start))
+        prepared.append(AudioMidiNote(note.start, note.start + duration, midi_note, note.velocity))
+    prepared = merge_audio_notes_by_pitch(
+        prepared,
+        merge_gap_seconds=max(0.015, beat_seconds * 0.02),
+        retrigger_gap_seconds=max(0.045, beat_seconds * 0.16),
+    )
+    prepared = enforce_audio_polyphony(
+        prepared,
+        max_polyphony=max(1, min(8, int(max_polyphony))),
+        beat_seconds=beat_seconds,
+        grid_seconds=grid_seconds,
+        low_midi=low_midi,
+        high_midi=high_midi,
+        melody_boost=1.0,
+        keep_bass=True,
+    )
+    prepared = enforce_visual_piano_keyboard_playability(
+        prepared,
+        beat_seconds=beat_seconds,
+        grid_seconds=grid_seconds,
+        low_midi=low_midi,
+        high_midi=high_midi,
+        keep_bass=True,
+    )
+    if not prepared:
+        return []
+    first_start = min(note.start for note in prepared)
+    return sorted(
+        [
+            AudioMidiNote(
+                start=max(0.0, note.start - first_start),
+                end=max(0.001, note.end - first_start),
+                midi=note.midi,
+                velocity=note.velocity,
+            )
+            for note in prepared
+        ],
+        key=lambda item: (item.start, item.midi, item.end),
+    )
+
+
+def cleanup_midi_actions_for_playability(
+    actions: list[ScheduledAction],
+    bpm: float,
+    low_midi: int,
+    high_midi: int,
+    max_polyphony: int = 4,
+) -> tuple[list[ScheduledAction], int, int]:
+    notes = scheduled_actions_to_audio_notes(actions)
+    cleaned = cleanup_midi_notes_for_playability(notes, bpm, low_midi, high_midi, max_polyphony=max_polyphony)
+    if notes and not cleaned:
+        return actions, len(notes), len(notes)
+    return audio_notes_to_actions(cleaned), len(notes), len(cleaned)
+
+
 def prepare_online_midi_load(
     result: OnlineSequenceResult,
     run_timing_repair: bool,
     repair_settings: dict[str, float | bool],
     trim_note_art_intro: bool = True,
+    cleanup_playability: bool = False,
 ) -> PreparedOnlineMidi:
     path = download_online_sequence_midi(result)
     actions = load_midi_actions(str(path))
@@ -1422,9 +1567,21 @@ def prepare_online_midi_load(
     repaired = False
     trimmed_seconds = 0.0
     trimmed_notes = 0
+    cleaned_before = 0
+    cleaned_after = 0
 
     if trim_note_art_intro:
         actions, trimmed_seconds, trimmed_notes = trim_note_art_intro_actions(actions)
+
+    if cleanup_playability:
+        cleanup_bpm = max(1.0, float(detected_bpm if detected_bpm is not None else repair_settings.get("bpm", 120.0)))
+        actions, cleaned_before, cleaned_after = cleanup_midi_actions_for_playability(
+            actions,
+            bpm=cleanup_bpm,
+            low_midi=int(repair_settings.get("low_midi", note_name_to_midi("C2"))),
+            high_midi=int(repair_settings.get("high_midi", note_name_to_midi("C7"))),
+            max_polyphony=4,
+        )
 
     if run_timing_repair:
         notes = scheduled_actions_to_audio_notes(actions)
@@ -1451,6 +1608,8 @@ def prepare_online_midi_load(
     summary = summarize_midi_actions_for_status(actions)
     if trimmed_seconds > 0:
         summary = f"{summary} | Skipped intro: {trimmed_seconds:.1f}s ({trimmed_notes} notes)"
+    if cleaned_before and cleaned_after:
+        summary = f"{summary} | Cleanup: {cleaned_before}->{cleaned_after} notes"
     return PreparedOnlineMidi(
         path=path,
         result=result,
@@ -1460,6 +1619,58 @@ def prepare_online_midi_load(
         repaired=repaired,
         trimmed_seconds=trimmed_seconds,
         trimmed_notes=trimmed_notes,
+        cleaned_before_notes=cleaned_before,
+        cleaned_after_notes=cleaned_after,
+    )
+
+
+def prepare_direct_midi_load(
+    url: str,
+    trim_note_art_intro: bool = True,
+    cleanup_playability: bool = False,
+    cleanup_settings: dict[str, float | bool] | None = None,
+) -> PreparedOnlineMidi:
+    path = download_direct_midi_url(url)
+    actions = load_midi_actions(str(path))
+    detected_bpm = read_midi_primary_bpm(path)
+    trimmed_seconds = 0.0
+    trimmed_notes = 0
+    cleaned_before = 0
+    cleaned_after = 0
+    if trim_note_art_intro:
+        actions, trimmed_seconds, trimmed_notes = trim_note_art_intro_actions(actions)
+    if cleanup_playability:
+        cleanup_settings = cleanup_settings or {}
+        cleanup_bpm = max(1.0, float(detected_bpm if detected_bpm is not None else cleanup_settings.get("bpm", 120.0)))
+        actions, cleaned_before, cleaned_after = cleanup_midi_actions_for_playability(
+            actions,
+            bpm=cleanup_bpm,
+            low_midi=int(cleanup_settings.get("low_midi", note_name_to_midi("C2"))),
+            high_midi=int(cleanup_settings.get("high_midi", note_name_to_midi("C7"))),
+            max_polyphony=4,
+        )
+    result = OnlineSequenceResult(
+        sequence_id="direct-midi",
+        title=Path(path).stem,
+        url=url,
+        midi_url=url,
+        source="Direct MIDI URL",
+    )
+    summary = summarize_midi_actions_for_status(actions)
+    if trimmed_seconds > 0:
+        summary = f"{summary} | Skipped intro: {trimmed_seconds:.1f}s ({trimmed_notes} notes)"
+    if cleaned_before and cleaned_after:
+        summary = f"{summary} | Cleanup: {cleaned_before}->{cleaned_after} notes"
+    return PreparedOnlineMidi(
+        path=path,
+        result=result,
+        actions=tuple(actions),
+        bpm=detected_bpm,
+        summary=summary,
+        trimmed_seconds=trimmed_seconds,
+        trimmed_notes=trimmed_notes,
+        cleaned_before_notes=cleaned_before,
+        cleaned_after_notes=cleaned_after,
     )
 
 
@@ -4069,6 +4280,8 @@ class PianoMacroApp(tk.Tk):
         self.hold_percent = tk.DoubleVar(value=0.9)
         self.gap_ms = tk.DoubleVar(value=20.0)
         self.start_delay = tk.DoubleVar(value=3.0)
+        self.playback_start_offset = tk.DoubleVar(value=0.0)
+        self.playback_end_at = tk.DoubleVar(value=0.0)
         self.transpose = tk.IntVar(value=0)
         self.high_note = tk.StringVar(value="C7")
         self.range_mode = tk.StringVar(value="Auto-fit octaves")
@@ -4304,19 +4517,20 @@ class PianoMacroApp(tk.Tk):
         ttk.Button(control_bar, text="Play", command=self.start_playback, style="Accent.TButton").grid(
             row=0, column=0, padx=(0, 6)
         )
-        ttk.Button(control_bar, text="Pause / Resume", command=self.toggle_pause).grid(row=0, column=1, padx=6)
+        ttk.Button(control_bar, text="Preview", command=self.start_preview_playback).grid(row=0, column=1, padx=6)
+        ttk.Button(control_bar, text="Pause / Resume", command=self.toggle_pause).grid(row=0, column=2, padx=6)
         ttk.Button(control_bar, text="Stop", command=self.stop_playback, style="Danger.TButton").grid(
-            row=0, column=2, padx=6
+            row=0, column=3, padx=6
         )
-        ttk.Button(control_bar, text="Load MIDI", command=self.load_midi).grid(row=0, column=3, padx=6)
-        ttk.Button(control_bar, text="Audio to MIDI", command=self.open_audio_to_midi_tool).grid(row=0, column=4, padx=6)
+        ttk.Button(control_bar, text="Load MIDI", command=self.load_midi).grid(row=0, column=4, padx=6)
+        ttk.Button(control_bar, text="Audio to MIDI", command=self.open_audio_to_midi_tool).grid(row=0, column=5, padx=6)
         ttk.Button(control_bar, text="Online MIDI Search", command=self.open_online_midi_search_tool).grid(
-            row=0, column=5, padx=6
+            row=0, column=6, padx=6
         )
-        ttk.Button(control_bar, text="Use Text", command=self.use_text_source).grid(row=0, column=6, padx=6)
-        ttk.Button(control_bar, text="Test C Scale", command=self.insert_test_scale).grid(row=0, column=7, padx=6)
+        ttk.Button(control_bar, text="Use Text", command=self.use_text_source).grid(row=0, column=7, padx=6)
+        ttk.Button(control_bar, text="Test C Scale", command=self.insert_test_scale).grid(row=0, column=8, padx=6)
         ttk.Label(control_bar, textvariable=self.loaded_midi_name, style="Muted.TLabel").grid(
-            row=0, column=8, columnspan=5, sticky="e"
+            row=0, column=9, columnspan=4, sticky="e"
         )
 
         paned = ttk.Panedwindow(root, orient=tk.HORIZONTAL)
@@ -4353,6 +4567,10 @@ class PianoMacroApp(tk.Tk):
         editor_actions.grid(row=1, column=0, sticky="ew", pady=(8, 4))
         ttk.Label(editor_actions, text="Song text", style="Section.TLabel").pack(side=tk.LEFT)
         ttk.Button(editor_actions, text="Analyze", command=self.analyze_current_source).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(editor_actions, text="Timeline", command=self.open_timeline_editor).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(editor_actions, text="Auto Cleanup MIDI", command=self.cleanup_loaded_midi_playability).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
         ttk.Button(editor_actions, text="MIDI to Text", command=self.convert_loaded_midi_to_text).pack(
             side=tk.RIGHT, padx=(6, 0)
         )
@@ -4414,6 +4632,10 @@ class PianoMacroApp(tk.Tk):
         self._spin(side, row, "Gap ms", self.gap_ms, 0, 250, 5)
         row += 1
         self._spin(side, row, "Start delay", self.start_delay, 0, 15, 0.5)
+        row += 1
+        self._spin(side, row, "Start at sec", self.playback_start_offset, 0, 3600, 0.5)
+        row += 1
+        self._spin(side, row, "End at sec", self.playback_end_at, 0, 3600, 0.5)
         row += 1
         self._spin(side, row, "Transpose", self.transpose, -36, 36, 1)
         row += 1
@@ -4972,6 +5194,8 @@ class PianoMacroApp(tk.Tk):
                 ("hold_percent", self.hold_percent),
                 ("gap_ms", self.gap_ms),
                 ("start_delay", self.start_delay),
+                ("playback_start_offset", self.playback_start_offset),
+                ("playback_end_at", self.playback_end_at),
                 ("transpose", self.transpose),
                 ("calibration_hold_seconds", self.calibration_hold_seconds),
                 ("timing_quantize_beats", self.timing_quantize_beats),
@@ -5020,6 +5244,8 @@ class PianoMacroApp(tk.Tk):
                 "hold_percent": float(self.hold_percent.get()),
                 "gap_ms": float(self.gap_ms.get()),
                 "start_delay": float(self.start_delay.get()),
+                "playback_start_offset": float(self.playback_start_offset.get()),
+                "playback_end_at": float(self.playback_end_at.get()),
                 "transpose": int(self.transpose.get()),
                 "high_note": self.high_note.get(),
                 "range_mode": self.range_mode.get(),
@@ -5313,6 +5539,8 @@ class PianoMacroApp(tk.Tk):
             "max_note_beats": max(0.1, float(self.timing_max_note_beats.get())),
             "gap_ms": max(0.0, float(self.timing_gap_ms.get())),
             "auto_offset": bool(self.timing_auto_offset.get()),
+            "low_midi": note_name_to_midi("C2"),
+            "high_midi": note_name_to_midi(self.high_note.get()),
         }
 
     def _apply_prepared_online_midi(self, prepared: PreparedOnlineMidi) -> None:
@@ -5324,13 +5552,24 @@ class PianoMacroApp(tk.Tk):
         self.current_song_id = None
         self.song_title.set(prepared.result.title)
         self.song_artist.set(prepared.result.author)
-        self.song_tags.set("online-midi,onlinesequencer")
-        notes = [
-            f"Downloaded from Online Sequencer #{prepared.result.sequence_id}: {prepared.result.url}",
-            f"Generated MIDI: {prepared.path}",
-        ]
+        is_direct_midi = prepared.result.source == "Direct MIDI URL"
+        self.song_tags.set("direct-midi" if is_direct_midi else "online-midi,onlinesequencer")
+        if is_direct_midi:
+            notes = [
+                f"Downloaded direct MIDI URL: {prepared.result.url}",
+                f"Saved MIDI: {prepared.path}",
+            ]
+        else:
+            notes = [
+                f"Downloaded from Online Sequencer #{prepared.result.sequence_id}: {prepared.result.url}",
+                f"Generated MIDI: {prepared.path}",
+            ]
         if prepared.trimmed_seconds > 0:
             notes.append(f"Skipped note-art intro: {prepared.trimmed_seconds:.1f}s, {prepared.trimmed_notes} notes removed.")
+        if prepared.cleaned_before_notes and prepared.cleaned_after_notes:
+            notes.append(
+                f"Auto-cleaned for Roblox: {prepared.cleaned_before_notes} -> {prepared.cleaned_after_notes} notes."
+            )
         if prepared.repaired:
             notes.append("Timing repair was applied during load.")
         self.song_notes.set("\n".join(notes))
@@ -5340,8 +5579,228 @@ class PianoMacroApp(tk.Tk):
             status_parts.append("note-art trim")
         if prepared.repaired:
             status_parts.append("timing repair")
+        if prepared.cleaned_before_notes and prepared.cleaned_after_notes:
+            status_parts.append("Roblox cleanup")
         suffix = f" with {', '.join(status_parts)}" if status_parts else ""
-        self.status.set(f"Loaded Online Sequencer MIDI{suffix}: {prepared.result.title}")
+        source_label = "direct MIDI" if is_direct_midi else "Online Sequencer MIDI"
+        self.status.set(f"Loaded {source_label}{suffix}: {prepared.result.title}")
+
+    def cleanup_loaded_midi_playability(self) -> None:
+        if not self.loaded_midi_actions:
+            self.status.set("Load or convert a MIDI first.")
+            return
+        try:
+            settings = self.read_settings()
+            cleaned_actions, before, after = cleanup_midi_actions_for_playability(
+                self.loaded_midi_actions,
+                bpm=settings.bpm,
+                low_midi=settings.low_midi,
+                high_midi=settings.high_midi,
+                max_polyphony=4,
+            )
+            if not cleaned_actions:
+                raise ValueError("Cleanup removed every note. Try a different MIDI.")
+            self.loaded_midi_actions = cleaned_actions
+            self.source_mode.set("midi")
+            self.status.set(f"Auto-cleaned MIDI for playback: {before} -> {after} notes.")
+            self.analyze_current_source(show_popup=False)
+        except Exception as exc:
+            messagebox.showerror("MIDI cleanup failed", str(exc))
+
+    def open_timeline_editor(self) -> None:
+        try:
+            settings = self.read_settings()
+            actions, source_name = self._base_actions_for_current_source(settings)
+            notes = scheduled_actions_to_audio_notes(actions)
+            if not actions:
+                raise ValueError("Nothing to show on the timeline.")
+        except Exception as exc:
+            messagebox.showerror("Timeline", str(exc))
+            return
+
+        duration = max((action.seconds for action in actions), default=0.0)
+        if notes:
+            duration = max(duration, max(note.end for note in notes))
+        duration = max(0.1, duration)
+
+        window = tk.Toplevel(self)
+        window.title("Timeline Editor")
+        window.geometry("880x520")
+        window.minsize(760, 440)
+        window.configure(bg=UI_BG)
+        window.transient(self)
+
+        start_var = tk.DoubleVar(value=max(0.0, float(self.playback_start_offset.get())))
+        end_var = tk.DoubleVar(value=max(0.0, float(self.playback_end_at.get())))
+        status_var = tk.StringVar(value=f"{source_name} | {len(notes)} notes | {duration:.1f}s")
+
+        root = ttk.Frame(window, padding=16)
+        root.pack(fill=tk.BOTH, expand=True)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        ttk.Label(root, text="Timeline Editor", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        canvas = tk.Canvas(root, bg=UI_FIELD, highlightthickness=1, highlightbackground=UI_BORDER, height=250)
+        canvas.grid(row=1, column=0, sticky="nsew", pady=(12, 10))
+
+        controls = ttk.Frame(root)
+        controls.grid(row=2, column=0, sticky="ew")
+        for column in range(10):
+            controls.columnconfigure(column, weight=1 if column in {8, 9} else 0)
+        ttk.Label(controls, text="Start sec").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Spinbox(controls, textvariable=start_var, from_=0, to=max(3600.0, duration), increment=0.5, width=10).grid(
+            row=0, column=1, padx=(0, 10)
+        )
+        ttk.Label(controls, text="End sec").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        ttk.Spinbox(controls, textvariable=end_var, from_=0, to=max(3600.0, duration), increment=0.5, width=10).grid(
+            row=0, column=3, padx=(0, 10)
+        )
+        ttk.Label(controls, text="0 = no end trim", style="Muted.TLabel").grid(row=0, column=4, sticky="w")
+        ttk.Label(root, textvariable=status_var, style="Muted.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+        def clamp_window(update_vars: bool = False) -> tuple[float, float]:
+            try:
+                start_raw = float(start_var.get())
+            except Exception:
+                start_raw = 0.0
+            try:
+                end_raw = float(end_var.get())
+            except Exception:
+                end_raw = 0.0
+            start = max(0.0, min(duration, start_raw))
+            end = max(0.0, min(duration, end_raw))
+            if end > 0 and end <= start:
+                end = min(duration, start + 0.5)
+            if update_vars:
+                start_var.set(round(start, 3))
+                end_var.set(round(end, 3) if end > 0 else 0.0)
+            return start, end
+
+        def draw_timeline() -> None:
+            canvas.delete("all")
+            width = max(1, canvas.winfo_width())
+            height = max(1, canvas.winfo_height())
+            margin = 18
+            lane_top = 18
+            lane_bottom = max(lane_top + 40, height - 66)
+            left = margin
+            right = max(left + 1, width - margin)
+            usable = right - left
+            canvas.create_line(left, lane_bottom, right, lane_bottom, fill=UI_BORDER)
+            if notes:
+                low = min(note.midi for note in notes)
+                high = max(note.midi for note in notes)
+                pitch_span = max(1, high - low)
+                sample_step = max(1, len(notes) // 1800)
+                for note in notes[::sample_step]:
+                    x1 = left + usable * (note.start / duration)
+                    x2 = left + usable * (note.end / duration)
+                    y = lane_bottom - (lane_bottom - lane_top) * ((note.midi - low) / pitch_span)
+                    canvas.create_rectangle(x1, y - 1, max(x1 + 1, x2), y + 1, fill=UI_ACCENT, outline="")
+            bin_count = min(160, max(16, int(width / 5)))
+            bins = [0] * bin_count
+            for note in notes:
+                index = min(bin_count - 1, max(0, int(note.start / duration * bin_count)))
+                bins[index] += 1
+            max_bin = max(bins) if bins else 1
+            bar_top = height - 48
+            bar_bottom = height - 20
+            for index, count in enumerate(bins):
+                x1 = left + usable * index / bin_count
+                x2 = left + usable * (index + 1) / bin_count
+                bar_h = (bar_bottom - bar_top) * (count / max_bin if max_bin else 0)
+                canvas.create_rectangle(x1, bar_bottom - bar_h, x2, bar_bottom, fill=UI_SELECTION, outline="")
+            start, end = clamp_window()
+            start_x = left + usable * (start / duration)
+            end_x = left + usable * (end / duration) if end > 0 else right
+            canvas.create_rectangle(start_x, 0, end_x, height, outline=UI_ACCENT, width=2)
+            canvas.create_line(start_x, 0, start_x, height, fill=UI_ACCENT, width=2)
+            if end > 0:
+                canvas.create_line(end_x, 0, end_x, height, fill=UI_DANGER, width=2)
+            canvas.create_text(left, height - 6, text="0s", fill=UI_MUTED, anchor="sw")
+            canvas.create_text(right, height - 6, text=f"{duration:.1f}s", fill=UI_MUTED, anchor="se")
+
+        def set_from_click(event: tk.Event) -> None:
+            width = max(1, canvas.winfo_width())
+            margin = 18
+            usable = max(1, width - margin * 2)
+            seconds = max(0.0, min(duration, (float(event.x) - margin) / usable * duration))
+            if getattr(event, "num", 1) == 3 or bool(getattr(event, "state", 0) & 0x0001):
+                end_var.set(round(seconds, 2))
+            else:
+                start_var.set(round(seconds, 2))
+            draw_timeline()
+
+        def use_as_playback_window() -> None:
+            start, end = clamp_window(update_vars=True)
+            self.playback_start_offset.set(start)
+            self.playback_end_at.set(end)
+            self.status.set(f"Playback window set: start {start:.1f}s" + (f", end {end:.1f}s." if end > 0 else "."))
+
+        def preview_window() -> None:
+            use_as_playback_window()
+            self.start_preview_playback()
+
+        def apply_trim() -> None:
+            if not self.loaded_midi_actions:
+                messagebox.showerror("Timeline", "Load a MIDI before applying timeline edits.")
+                return
+            start, end = clamp_window(update_vars=True)
+            trimmed = window_scheduled_actions(self.loaded_midi_actions, start, end)
+            if not trimmed:
+                messagebox.showerror("Timeline", "That trim would remove every note.")
+                return
+            self.loaded_midi_actions = trimmed
+            self.playback_start_offset.set(0.0)
+            self.playback_end_at.set(0.0)
+            self.status.set(f"Applied timeline trim: start {start:.1f}s" + (f", end {end:.1f}s." if end > 0 else "."))
+            self.analyze_current_source(show_popup=False)
+            window.destroy()
+
+        def delete_range() -> None:
+            if not self.loaded_midi_actions:
+                messagebox.showerror("Timeline", "Load a MIDI before deleting sections.")
+                return
+            start, end = clamp_window(update_vars=True)
+            if end <= start:
+                messagebox.showerror("Timeline", "Set an end time after the start time first.")
+                return
+            notes_before = scheduled_actions_to_audio_notes(self.loaded_midi_actions)
+            kept: list[AudioMidiNote] = []
+            for note in notes_before:
+                if note.end <= start:
+                    kept.append(note)
+                elif note.start >= end:
+                    kept.append(AudioMidiNote(note.start - (end - start), note.end - (end - start), note.midi, note.velocity))
+            if not kept:
+                messagebox.showerror("Timeline", "That delete would remove every note.")
+                return
+            self.loaded_midi_actions = audio_notes_to_actions(kept)
+            self.playback_start_offset.set(0.0)
+            self.playback_end_at.set(0.0)
+            self.status.set(f"Deleted timeline range {start:.1f}s-{end:.1f}s.")
+            self.analyze_current_source(show_popup=False)
+            window.destroy()
+
+        def cleanup_from_timeline() -> None:
+            self.cleanup_loaded_midi_playability()
+            window.destroy()
+
+        button_row = ttk.Frame(root)
+        button_row.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        ttk.Button(button_row, text="Use Window", command=use_as_playback_window, style="Accent.TButton").pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Preview Window", command=preview_window).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="Apply Trim to MIDI", command=apply_trim).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="Delete Range", command=delete_range).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="Auto Cleanup", command=cleanup_from_timeline).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_row, text="Close", command=window.destroy).pack(side=tk.RIGHT)
+
+        canvas.bind("<Configure>", lambda _event: draw_timeline())
+        canvas.bind("<Button-1>", set_from_click)
+        canvas.bind("<Button-3>", set_from_click)
+        start_var.trace_add("write", lambda *_: draw_timeline())
+        end_var.trace_add("write", lambda *_: draw_timeline())
+        window.after(80, draw_timeline)
 
     def open_online_midi_search_tool(self) -> None:
         window = tk.Toplevel(self)
@@ -5358,6 +5817,7 @@ class PianoMacroApp(tk.Tk):
         detail_var = tk.StringVar(value="Select a result to see its page. MIDI files are generated locally from page data.")
         auto_repair_var = tk.BooleanVar(value=False)
         auto_trim_art_var = tk.BooleanVar(value=True)
+        auto_cleanup_var = tk.BooleanVar(value=True)
         results_by_iid: dict[str, OnlineSequenceResult] = {}
         current_results: dict[str, list[OnlineSequenceResult]] = {"items": []}
         result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -5459,10 +5919,13 @@ class PianoMacroApp(tk.Tk):
         ttk.Checkbutton(options_row, text="Auto-skip note-art intro", variable=auto_trim_art_var).grid(
             row=0, column=1, sticky="w", padx=(0, 12)
         )
+        ttk.Checkbutton(options_row, text="Auto-clean for Roblox", variable=auto_cleanup_var).grid(
+            row=0, column=2, sticky="w", padx=(0, 12)
+        )
 
         button_row = ttk.Frame(root)
         button_row.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        for column in range(6):
+        for column in range(7):
             button_row.columnconfigure(column, weight=1 if column in {0, 1} else 0)
 
         def selected_result() -> OnlineSequenceResult | None:
@@ -5476,7 +5939,14 @@ class PianoMacroApp(tk.Tk):
             busy["value"] = enabled
             if text:
                 status_var.set(text)
-            widgets = (search_button, download_load_button, download_button, open_page_button, copy_url_button)
+            widgets = (
+                search_button,
+                download_load_button,
+                download_button,
+                direct_url_button,
+                open_page_button,
+                copy_url_button,
+            )
             for widget in widgets:
                 widget.configure(state=tk.DISABLED if enabled else tk.NORMAL)
             sort_box.configure(state=tk.DISABLED if enabled else "readonly")
@@ -5599,6 +6069,7 @@ class PianoMacroApp(tk.Tk):
                 return
             auto_repair = bool(auto_repair_var.get())
             auto_trim_art = bool(auto_trim_art_var.get())
+            auto_cleanup = bool(auto_cleanup_var.get())
             repair_settings = self._online_midi_repair_settings()
             if load_after:
                 set_busy(True, f"Downloading and preparing MIDI for: {result.title}")
@@ -5609,11 +6080,44 @@ class PianoMacroApp(tk.Tk):
             def worker() -> None:
                 try:
                     if load_after:
-                        prepared = prepare_online_midi_load(result, auto_repair, repair_settings, auto_trim_art)
+                        prepared = prepare_online_midi_load(
+                            result,
+                            auto_repair,
+                            repair_settings,
+                            trim_note_art_intro=auto_trim_art,
+                            cleanup_playability=auto_cleanup,
+                        )
                         result_queue.put(("load_ok", prepared))
                     else:
                         path = download_online_sequence_midi(result)
                         result_queue.put(("download_ok", (path, result)))
+                except Exception as exc:
+                    result_queue.put(("error", str(exc)))
+
+            threading.Thread(target=worker, daemon=True).start()
+            window.after(100, poll_results)
+
+        def load_direct_midi_url() -> None:
+            if busy["value"]:
+                return
+            url = simpledialog.askstring("Load MIDI URL", "Paste a direct .mid/.midi URL:", parent=window)
+            if not url:
+                return
+            auto_trim_art = bool(auto_trim_art_var.get())
+            auto_cleanup = bool(auto_cleanup_var.get())
+            cleanup_settings = self._online_midi_repair_settings()
+            set_busy(True, "Downloading direct MIDI URL.")
+            detail_var.set(url)
+
+            def worker() -> None:
+                try:
+                    prepared = prepare_direct_midi_load(
+                        url,
+                        trim_note_art_intro=auto_trim_art,
+                        cleanup_playability=auto_cleanup,
+                        cleanup_settings=cleanup_settings,
+                    )
+                    result_queue.put(("load_ok", prepared))
                 except Exception as exc:
                     result_queue.put(("error", str(exc)))
 
@@ -5664,11 +6168,13 @@ class PianoMacroApp(tk.Tk):
         download_load_button.grid(row=0, column=1, sticky="ew", padx=6)
         download_button = ttk.Button(button_row, text="Download Only", command=lambda: download_selected(False))
         download_button.grid(row=0, column=2, padx=6)
+        direct_url_button = ttk.Button(button_row, text="Load MIDI URL", command=load_direct_midi_url)
+        direct_url_button.grid(row=0, column=3, padx=6)
         open_page_button = ttk.Button(button_row, text="Open Page", command=open_selected_page)
-        open_page_button.grid(row=0, column=3, padx=6)
+        open_page_button.grid(row=0, column=4, padx=6)
         copy_url_button = ttk.Button(button_row, text="Copy Page URL", command=copy_selected_page_url)
-        copy_url_button.grid(row=0, column=4, padx=6)
-        ttk.Button(button_row, text="Close", command=window.destroy).grid(row=0, column=5, padx=(6, 0))
+        copy_url_button.grid(row=0, column=5, padx=6)
+        ttk.Button(button_row, text="Close", command=window.destroy).grid(row=0, column=6, padx=(6, 0))
 
         query_entry.bind("<Return>", lambda _event: start_search())
         sort_box.bind("<<ComboboxSelected>>", lambda _event: resort_from_dropdown())
@@ -6455,6 +6961,10 @@ class PianoMacroApp(tk.Tk):
         window.protocol("WM_DELETE_WINDOW", close_audio_tool)
 
     def _actions_for_current_source(self, settings: PlaybackSettings) -> tuple[list[ScheduledAction], str]:
+        actions, source_name = self._base_actions_for_current_source(settings)
+        return window_scheduled_actions(actions, settings.start_offset_seconds, settings.end_at_seconds), source_name
+
+    def _base_actions_for_current_source(self, settings: PlaybackSettings) -> tuple[list[ScheduledAction], str]:
         if self.source_mode.get() == "midi" and self.loaded_midi_actions:
             return self.loaded_midi_actions, self.loaded_midi_name.get()
         text = self.score_text.get("1.0", tk.END)
@@ -6681,6 +7191,8 @@ class PianoMacroApp(tk.Tk):
         hold_percent = min(1.0, max(0.05, float(self.hold_percent.get())))
         gap_ms = max(0.0, float(self.gap_ms.get()))
         start_delay = max(0.0, float(self.start_delay.get()))
+        start_offset_seconds = max(0.0, float(self.playback_start_offset.get()))
+        end_at_seconds = max(0.0, float(self.playback_end_at.get()))
         transpose = int(self.transpose.get())
         low_midi = note_name_to_midi("C2")
         high_midi = note_name_to_midi(self.high_note.get())
@@ -6691,28 +7203,30 @@ class PianoMacroApp(tk.Tk):
             hold_percent=hold_percent,
             gap_ms=gap_ms,
             start_delay=start_delay,
+            start_offset_seconds=start_offset_seconds,
+            end_at_seconds=end_at_seconds,
             transpose=transpose,
             low_midi=low_midi,
             high_midi=high_midi,
             range_mode=self.range_mode.get(),
         )
 
+    def start_preview_playback(self) -> None:
+        self._start_playback(preview_override=True)
+
     def start_playback(self) -> None:
+        self._start_playback(preview_override=None)
+
+    def _start_playback(self, preview_override: bool | None = None) -> None:
         if self.play_thread and self.play_thread.is_alive():
             self.status.set("Already playing. Use Pause or Stop.")
             return
         try:
             self.sender.set_method(self.input_method.get())
             settings = self.read_settings()
-            preview_only = bool(self.preview_only.get())
-            if self.source_mode.get() == "midi" and self.loaded_midi_actions:
-                actions = coalesce_scheduled_actions(self.loaded_midi_actions)
-                source_name = self.loaded_midi_name.get()
-            else:
-                text = self.score_text.get("1.0", tk.END)
-                events = parse_text_score(text, settings.default_beats)
-                actions = coalesce_scheduled_actions(text_events_to_actions(events, settings))
-                source_name = "text score"
+            preview_only = bool(self.preview_only.get()) if preview_override is None else bool(preview_override)
+            actions, source_name = self._actions_for_current_source(settings)
+            actions = coalesce_scheduled_actions(actions)
             if not actions:
                 raise ValueError("Nothing to play.")
         except Exception as exc:

@@ -45,12 +45,18 @@ transpose, and input method when it closes.
 - Click `Online MIDI Search` to search public Online Sequencer songs by title,
   URL, or sequence ID, then download and load a generated MIDI directly into the
   studio.
+- Use `Load MIDI URL` inside Online MIDI Search for direct `.mid` links from
+  other MIDI sites.
 - Click `Audio to MIDI` to convert a local `.wav`, `.mp3`, `.flac`, `.ogg`,
   `.m4a`, or `.aac` file into playable notes.
 - Click `Analyze` to check length, note count, range, max held notes, and
   suggested transpose.
 - Click `Apply Suggested Transpose` if the analyzer finds a better fit.
-- Use `Preview only` to watch the keyboard animation without sending keys.
+- Click `Preview` or use `Preview only` to watch the keyboard animation without
+  sending keys.
+- Use `Timeline` to preview, trim, delete bad sections, or set a playback
+  window.
+- Use `Auto Cleanup MIDI` to simplify dense MIDI files for Roblox playback.
 - Click `MIDI to Text` after loading a MIDI to convert it into editable notation
   that can be saved in the library.
 
@@ -76,6 +82,11 @@ while they are parsed.
 `Auto-skip note-art intro` is enabled by default. It detects extremely dense
 intro note art and starts playback after that section instead of smashing the
 Roblox piano with thousands of decorative notes.
+`Auto-clean for Roblox` can simplify downloaded files by reducing impossible
+polyphony, octave-fitting notes into range, and removing Visual Pianos key
+conflicts. Turn it off if you want the raw MIDI.
+Use `Load MIDI URL` for direct `.mid`/`.midi` links from other sites such as
+VGMusic or MIDIWorld.
 
 Recommended workflow:
 
@@ -87,6 +98,20 @@ Recommended workflow:
 
 Double-clicking a result also downloads and loads it. Use `Download Only` if you
 want to save the generated `.mid` without replacing the currently loaded song.
+
+## Preview And Timeline
+
+`Preview` plays the current song on the built-in keyboard only. It does not send
+keys to Roblox.
+
+`Start at sec` and `End at sec` in the Playback section let you skip or stop at
+specific times without permanently editing the MIDI. Set `End at sec` to `0` to
+play through the end.
+
+`Timeline` opens a visual note overview. Left-click the timeline to set the
+start time; right-click to set the end time. From there you can preview the
+window, apply the trim to the loaded MIDI, delete a bad range, or run automatic
+Roblox cleanup.
 
 ## Audio To MIDI
 

@@ -3,6 +3,8 @@
 Windows GUI for playing Visual Pianos-style Roblox/JJS piano layouts with
 hotkeys, MIDI import, online MIDI search, live preview, and audio-to-MIDI
 conversion.
+It also includes a preview player, timeline trim tools, direct MIDI URL loading,
+and Roblox-friendly MIDI cleanup.
 
 The app lives in `outputs/`.
 
