@@ -58,7 +58,6 @@ APP_TITLE = "JJS Piano Studio"
 DEFAULT_HOTKEY_PLAY = "F6"
 DEFAULT_HOTKEY_STOP = "F8"
 DEFAULT_HOTKEY_PAUSE = "F7"
-HOTKEY_OPTIONS = ["F6", "F7", "F8", "F9", "F10", "F11", "F12"]
 CONFIG_PATH = Path(__file__).with_name("piano_macro_settings.json")
 LIBRARY_PATH = Path(__file__).with_name("piano_studio_library.json")
 JOB_DIR = Path(__file__).with_name("audio_conversion_jobs")
@@ -4051,6 +4050,9 @@ class PianoMacroApp(tk.Tk):
         self.preview_active_notes: set[int] = set()
         self.listener = None
         self.pressed_hotkey_parts: set[str] = set()
+        self.hotkey_capture_target: tuple[str, tk.StringVar] | None = None
+        self.hotkey_capture_block_name: str | None = None
+        self.hotkey_capture_block_until = 0.0
         self.play_hotkey = tk.StringVar(value=DEFAULT_HOTKEY_PLAY)
         self.pause_hotkey = tk.StringVar(value=DEFAULT_HOTKEY_PAUSE)
         self.stop_hotkey = tk.StringVar(value=DEFAULT_HOTKEY_STOP)
@@ -4086,6 +4088,7 @@ class PianoMacroApp(tk.Tk):
         self._load_settings()
         self._load_song_library()
         self._build_ui()
+        self.bind_all("<KeyPress>", self._on_tk_hotkey_capture, add="+")
         self.after(100, self.draw_keyboard_preview)
         self.after(150, self.load_latest_song_on_startup)
         self._start_hotkeys()
@@ -4517,17 +4520,17 @@ class PianoMacroApp(tk.Tk):
         ttk.Label(side, text="Hotkeys", style="Section.TLabel").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         ttk.Label(side, text="Play").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(side, textvariable=self.play_hotkey, values=HOTKEY_OPTIONS, state="readonly", width=18).grid(
+        ttk.Button(side, textvariable=self.play_hotkey, command=lambda: self.begin_hotkey_capture("Play", self.play_hotkey)).grid(
             row=row, column=1, sticky="ew", pady=4
         )
         row += 1
         ttk.Label(side, text="Pause").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(side, textvariable=self.pause_hotkey, values=HOTKEY_OPTIONS, state="readonly", width=18).grid(
+        ttk.Button(side, textvariable=self.pause_hotkey, command=lambda: self.begin_hotkey_capture("Pause", self.pause_hotkey)).grid(
             row=row, column=1, sticky="ew", pady=4
         )
         row += 1
         ttk.Label(side, text="Stop").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(side, textvariable=self.stop_hotkey, values=HOTKEY_OPTIONS, state="readonly", width=18).grid(
+        ttk.Button(side, textvariable=self.stop_hotkey, command=lambda: self.begin_hotkey_capture("Stop", self.stop_hotkey)).grid(
             row=row, column=1, sticky="ew", pady=4
         )
         row += 1
@@ -4995,13 +4998,13 @@ class PianoMacroApp(tk.Tk):
                     ["Windows SendInput scan", "Windows SendInput vk", "Windows keybd_event", "PyAutoGUI"],
                 ),
                 ("calibration_note", self.calibration_note, NOTE_OPTIONS),
-                ("play_hotkey", self.play_hotkey, HOTKEY_OPTIONS),
-                ("pause_hotkey", self.pause_hotkey, HOTKEY_OPTIONS),
-                ("stop_hotkey", self.stop_hotkey, HOTKEY_OPTIONS),
+                ("play_hotkey", self.play_hotkey, None),
+                ("pause_hotkey", self.pause_hotkey, None),
+                ("stop_hotkey", self.stop_hotkey, None),
             ]
             for key, variable, allowed in string_settings:
                 value = data.get(key)
-                if isinstance(value, str) and (allowed is None or value in allowed):
+                if isinstance(value, str) and value.strip() and (allowed is None or value in allowed):
                     variable.set(value)
             self._refresh_hotkey_state()
             self.settings_loaded = True
@@ -5039,6 +5042,36 @@ class PianoMacroApp(tk.Tk):
         except Exception as exc:
             self.status.set(f"Could not save settings: {exc}")
 
+    def begin_hotkey_capture(self, action_name: str, variable: tk.StringVar) -> None:
+        self.hotkey_capture_target = (action_name, variable)
+        self.status.set(f"Press the key to use for {action_name}.")
+
+    def _apply_captured_hotkey(self, hotkey_name: str) -> None:
+        target = self.hotkey_capture_target
+        if target is None:
+            return
+        action_name, variable = target
+        self.hotkey_capture_target = None
+        normalized_name = self._normalize_hotkey(hotkey_name)
+        self.hotkey_capture_block_name = normalized_name
+        self.hotkey_capture_block_until = time.perf_counter() + 0.75
+        display_name = self._format_hotkey_name(hotkey_name)
+        variable.set(display_name)
+        if not self._refresh_hotkey_state():
+            self.status.set("Hotkey conflict: choose different keys for Play, Pause, and Stop.")
+            return
+        self.status.set(f"{action_name} hotkey set to {display_name}.")
+
+    def _on_tk_hotkey_capture(self, event: tk.Event) -> str | None:
+        if self.hotkey_capture_target is None:
+            return None
+        hotkey_name = self._tk_hotkey_name(event)
+        if not hotkey_name:
+            self.status.set("That key cannot be used as a hotkey. Press another key.")
+            return "break"
+        self._apply_captured_hotkey(hotkey_name)
+        return "break"
+
     def _start_hotkeys(self) -> None:
         if pynput_keyboard is None:
             self.status.set("Ready. Install pynput for global hotkeys: python -m pip install pynput")
@@ -5047,6 +5080,11 @@ class PianoMacroApp(tk.Tk):
         def on_press(key: object) -> None:
             name = self._hotkey_name(key)
             if not name:
+                return
+            if self.hotkey_capture_target is not None:
+                self.after(0, lambda captured=name: self._apply_captured_hotkey(captured))
+                return
+            if name == self.hotkey_capture_block_name and time.perf_counter() < self.hotkey_capture_block_until:
                 return
             if name in self.pressed_hotkey_parts:
                 return
@@ -5072,14 +5110,43 @@ class PianoMacroApp(tk.Tk):
 
     @staticmethod
     def _normalize_hotkey(value: str) -> str:
-        return value.strip().lower()
+        return value.strip().lower().replace(" ", "_").replace("-", "_")
+
+    @staticmethod
+    def _format_hotkey_name(value: str) -> str:
+        normalized = PianoMacroApp._normalize_hotkey(value)
+        labels = {
+            "ctrl": "Ctrl",
+            "alt": "Alt",
+            "space": "Space",
+            "enter": "Enter",
+            "esc": "Esc",
+            "tab": "Tab",
+            "backspace": "Backspace",
+            "delete": "Delete",
+            "insert": "Insert",
+            "home": "Home",
+            "end": "End",
+            "page_up": "Page Up",
+            "page_down": "Page Down",
+            "up": "Up",
+            "down": "Down",
+            "left": "Left",
+            "right": "Right",
+            "caps_lock": "Caps Lock",
+        }
+        if re.fullmatch(r"f\d{1,2}", normalized):
+            return normalized.upper()
+        if len(normalized) == 1:
+            return normalized.upper()
+        return labels.get(normalized, normalized.replace("_", " ").title())
 
     def _refresh_hotkey_state(self) -> bool:
         self.current_play_hotkey = self._normalize_hotkey(self.play_hotkey.get())
         self.current_pause_hotkey = self._normalize_hotkey(self.pause_hotkey.get())
         self.current_stop_hotkey = self._normalize_hotkey(self.stop_hotkey.get())
         hotkeys = [self.current_play_hotkey, self.current_pause_hotkey, self.current_stop_hotkey]
-        self.hotkeys_unique = len(set(hotkeys)) == len(hotkeys)
+        self.hotkeys_unique = all(hotkeys) and len(set(hotkeys)) == len(hotkeys)
         return self.hotkeys_unique
 
     def _on_hotkey_changed(self, *_: object) -> None:
@@ -5092,6 +5159,39 @@ class PianoMacroApp(tk.Tk):
         )
 
     @staticmethod
+    def _tk_hotkey_name(event: tk.Event) -> str | None:
+        keysym = str(getattr(event, "keysym", "") or "")
+        char = str(getattr(event, "char", "") or "")
+        if char and len(char) == 1 and char.isprintable() and not char.isspace():
+            return char.lower()
+        if re.fullmatch(r"F\d{1,2}", keysym):
+            return keysym.lower()
+        mapping = {
+            "space": "space",
+            "Return": "enter",
+            "KP_Enter": "enter",
+            "Escape": "esc",
+            "Tab": "tab",
+            "BackSpace": "backspace",
+            "Delete": "delete",
+            "Insert": "insert",
+            "Home": "home",
+            "End": "end",
+            "Prior": "page_up",
+            "Next": "page_down",
+            "Up": "up",
+            "Down": "down",
+            "Left": "left",
+            "Right": "right",
+            "Caps_Lock": "caps_lock",
+            "Control_L": "ctrl",
+            "Control_R": "ctrl",
+            "Alt_L": "alt",
+            "Alt_R": "alt",
+        }
+        return mapping.get(keysym)
+
+    @staticmethod
     def _hotkey_name(key: object) -> str | None:
         if pynput_keyboard is None:
             return None
@@ -5101,22 +5201,46 @@ class PianoMacroApp(tk.Tk):
             return "alt"
         if key == pynput_keyboard.Key.space:
             return "space"
-        function_keys = {
-            pynput_keyboard.Key.f1: "f1",
-            pynput_keyboard.Key.f2: "f2",
-            pynput_keyboard.Key.f3: "f3",
-            pynput_keyboard.Key.f4: "f4",
-            pynput_keyboard.Key.f5: "f5",
-            pynput_keyboard.Key.f6: "f6",
-            pynput_keyboard.Key.f7: "f7",
-            pynput_keyboard.Key.f8: "f8",
-            pynput_keyboard.Key.f9: "f9",
-            pynput_keyboard.Key.f10: "f10",
-            pynput_keyboard.Key.f11: "f11",
-            pynput_keyboard.Key.f12: "f12",
+        key_names = {
+            "f1": "f1",
+            "f2": "f2",
+            "f3": "f3",
+            "f4": "f4",
+            "f5": "f5",
+            "f6": "f6",
+            "f7": "f7",
+            "f8": "f8",
+            "f9": "f9",
+            "f10": "f10",
+            "f11": "f11",
+            "f12": "f12",
+            "f13": "f13",
+            "f14": "f14",
+            "f15": "f15",
+            "f16": "f16",
+            "f17": "f17",
+            "f18": "f18",
+            "f19": "f19",
+            "f20": "f20",
+            "enter": "enter",
+            "esc": "esc",
+            "tab": "tab",
+            "backspace": "backspace",
+            "delete": "delete",
+            "insert": "insert",
+            "home": "home",
+            "end": "end",
+            "page_up": "page_up",
+            "page_down": "page_down",
+            "up": "up",
+            "down": "down",
+            "left": "left",
+            "right": "right",
+            "caps_lock": "caps_lock",
         }
-        if key in function_keys:
-            return function_keys[key]
+        for attribute, name in key_names.items():
+            if hasattr(pynput_keyboard.Key, attribute) and key == getattr(pynput_keyboard.Key, attribute):
+                return name
         char = getattr(key, "char", None)
         if char:
             return char.lower()

@@ -32,8 +32,9 @@ Use Python 3.11 if the audio-to-MIDI packages fail on newer Python versions.
 5. Press `F6` to play after the start delay.
 6. Use `F7` to pause/resume and `F8` to stop.
 
-The hotkeys can be changed in the `Hotkeys` section. The app saves your
-controls, timing, range, transpose, and input method when it closes.
+Hotkeys can be changed in the `Hotkeys` section: click a hotkey button, then
+press the key you want to use. The app saves your controls, timing, range,
+transpose, and input method when it closes.
 
 ## Studio Workflow
 
